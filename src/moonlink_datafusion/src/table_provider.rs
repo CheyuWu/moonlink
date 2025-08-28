@@ -1,3 +1,4 @@
+use crate::connection_pool::{get_stream, return_stream};
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
@@ -39,7 +40,7 @@ pub struct MooncakeTableProvider {
 
 impl MooncakeTableProvider {
     pub async fn try_new(uri: &str, schema: String, table: String, lsn: u64) -> Result<Self> {
-        let mut stream = UnixStream::connect(uri).await?;
+        let mut stream = get_stream(uri).await?;
         let table_schema = get_table_schema(&mut stream, schema.clone(), table.clone()).await?;
         let table_schema = StreamReader::try_new(table_schema.as_slice(), None)?.schema();
         let scan = Arc::new(MooncakeTableScan::try_new(stream, schema, table, lsn).await?);
@@ -238,6 +239,7 @@ impl Drop for MooncakeTableScan {
             if let Err(e) = scan_table_end(&mut stream, schema, table).await {
                 eprintln!("scan_table_end error: {e}");
             }
+            return_stream(stream).await;
         });
     }
 }
