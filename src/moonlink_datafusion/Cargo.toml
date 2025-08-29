@@ -18,5 +18,6 @@ moonlink_table_metadata = { path = "../moonlink_table_metadata" }
 object_store = { workspace = true }
 parquet = { workspace = true }
 roaring = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

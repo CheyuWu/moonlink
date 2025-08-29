@@ -203,7 +203,7 @@ impl ParquetFileReaderFactory for MooncakeParquetFileReaderFactory {
 }
 
 #[derive(Debug)]
-struct MooncakeTableScan {
+pub(crate) struct MooncakeTableScan {
     stream: Option<UnixStream>,
     schema: String,
     table: String,
