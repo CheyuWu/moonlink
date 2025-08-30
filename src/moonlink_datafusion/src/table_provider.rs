@@ -1,4 +1,4 @@
-use crate::connection_pool::{get_stream, return_stream};
+use crate::connection_pool::{get_stream, return_stream, PooledStream};
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
@@ -30,7 +30,6 @@ use std::any::Any;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-use tokio::net::UnixStream;
 
 #[derive(Debug)]
 pub struct MooncakeTableProvider {
@@ -40,10 +39,11 @@ pub struct MooncakeTableProvider {
 
 impl MooncakeTableProvider {
     pub async fn try_new(uri: &str, schema: String, table: String, lsn: u64) -> Result<Self> {
-        let mut stream = get_stream(uri).await?;
-        let table_schema = get_table_schema(&mut stream, schema.clone(), table.clone()).await?;
+        let mut pooled_stream = get_stream(uri).await?;
+        let table_schema =
+            get_table_schema(&mut pooled_stream.stream, schema.clone(), table.clone()).await?;
         let table_schema = StreamReader::try_new(table_schema.as_slice(), None)?.schema();
-        let scan = Arc::new(MooncakeTableScan::try_new(stream, schema, table, lsn).await?);
+        let scan = Arc::new(MooncakeTableScan::try_new(pooled_stream, schema, table, lsn).await?);
         Ok(Self {
             schema: table_schema,
             scan,
@@ -203,8 +203,8 @@ impl ParquetFileReaderFactory for MooncakeParquetFileReaderFactory {
 }
 
 #[derive(Debug)]
-pub(crate) struct MooncakeTableScan {
-    stream: Option<UnixStream>,
+struct MooncakeTableScan {
+    pooled_stream: Option<PooledStream>,
     schema: String,
     table: String,
     metadata: MooncakeTableMetadata,
@@ -212,16 +212,22 @@ pub(crate) struct MooncakeTableScan {
 
 impl MooncakeTableScan {
     async fn try_new(
-        mut stream: UnixStream,
+        mut pooled_stream: PooledStream,
         schema: String,
         table: String,
         lsn: u64,
     ) -> Result<Self> {
-        let metadata = scan_table_begin(&mut stream, schema.clone(), table.clone(), lsn).await?;
+        let metadata = scan_table_begin(
+            &mut pooled_stream.stream,
+            schema.clone(),
+            table.clone(),
+            lsn,
+        )
+        .await?;
         let metadata: MooncakeTableMetadata =
             bincode::decode_from_slice(&metadata, config::standard())?.0;
         Ok(Self {
-            stream: Some(stream),
+            pooled_stream: Some(pooled_stream),
             schema,
             table,
             metadata,
@@ -231,15 +237,15 @@ impl MooncakeTableScan {
 
 impl Drop for MooncakeTableScan {
     fn drop(&mut self) {
-        let stream = self.stream.take();
+        let pooled_stream = self.pooled_stream.take();
         let schema = std::mem::take(&mut self.schema);
         let table = std::mem::take(&mut self.table);
         tokio::spawn(async move {
-            let mut stream = stream.expect("stream should be set by try_new");
-            if let Err(e) = scan_table_end(&mut stream, schema, table).await {
+            let mut pooled_stream = pooled_stream.expect("stream should be set by try_new");
+            if let Err(e) = scan_table_end(&mut pooled_stream.stream, schema, table).await {
                 eprintln!("scan_table_end error: {e}");
             }
-            return_stream(stream).await;
+            return_stream(pooled_stream).await;
         });
     }
 }
