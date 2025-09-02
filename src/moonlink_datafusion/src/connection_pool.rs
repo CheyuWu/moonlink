@@ -4,12 +4,31 @@ use tokio::{net::UnixStream, sync::Mutex};
 #[derive(Debug)]
 pub struct PooledStream {
     pub uri: String,
-    pub stream: UnixStream,
+    pub stream: Option<UnixStream>,
 }
 
 impl PooledStream {
     pub fn new(uri: String, stream: UnixStream) -> Self {
-        PooledStream { uri, stream }
+        Self {
+            uri,
+            stream: Some(stream),
+        }
+    }
+    pub fn stream_mut(&mut self) -> &mut UnixStream {
+        self.stream.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledStream {
+    fn drop(&mut self) {
+        if let Some(stream) = self.stream.take() {
+            let uri = self.uri.clone();
+
+            tokio::spawn(async move {
+                let mut pool = POOL.lock().await;
+                pool.entry(uri).or_default().lock().await.push(stream);
+            });
+        }
     }
 }
 
@@ -17,30 +36,22 @@ static POOL: LazyLock<Mutex<HashMap<String, Mutex<Vec<UnixStream>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) async fn get_stream(uri: &str) -> crate::Result<PooledStream> {
-    let mut pool = POOL.lock().await;
-    if let Some(mutex_vec) = pool.get_mut(uri) {
-        let mut vec = mutex_vec.lock().await;
-        if let Some(stream) = vec.pop() {
-            return Ok(PooledStream::new(uri.to_string(), stream));
+    {
+        let mut pool = POOL.lock().await;
+        if let Some(mutex_vec) = pool.get_mut(uri) {
+            let mut vec = mutex_vec.lock().await;
+            if let Some(stream) = vec.pop() {
+                return Ok(PooledStream::new(uri.to_string(), stream));
+            }
         }
     }
     let stream = UnixStream::connect(uri).await?;
     Ok(PooledStream::new(uri.to_string(), stream))
 }
 
-pub(crate) async fn return_stream(pooled_stream: PooledStream) {
-    let mut pool = POOL.lock().await;
-
-    pool.entry(pooled_stream.uri.clone())
-        .or_default()
-        .lock()
-        .await
-        .push(pooled_stream.stream);
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::connection_pool::{get_stream, return_stream};
+    use crate::connection_pool::get_stream;
     use tempfile::tempdir;
     use tokio::net::UnixListener;
 
@@ -58,10 +69,11 @@ mod tests {
         });
 
         let stream1 = get_stream(&uri_str).await.expect("should connect");
-        return_stream(stream1).await;
+        drop(stream1);
 
-        let stream2 = get_stream(&uri_str).await.expect("should reuse from pool");
-        assert!(stream2.stream.into_std().is_ok());
+        let mut stream2 = get_stream(&uri_str).await.expect("should reuse from pool");
+        let unix_stream = stream2.stream.take().unwrap();
+        assert!(unix_stream.into_std().is_ok());
     }
 
     #[tokio::test]
@@ -91,11 +103,11 @@ mod tests {
         // Retrieve streams for URI1 and URI2 concurrently
         let (stream1, stream2) = tokio::join!(get_stream(uri1), get_stream(uri2));
 
-        let stream1 = stream1.expect("connect URI1");
-        let stream2 = stream2.expect("connect URI2");
+        let mut stream1 = stream1.expect("connect URI1");
+        let mut stream2 = stream2.expect("connect URI2");
 
-        let addr1 = stream1.stream.peer_addr().unwrap();
-        let addr2 = stream2.stream.peer_addr().unwrap();
+        let addr1 = stream1.stream_mut().peer_addr().unwrap();
+        let addr2 = stream2.stream_mut().peer_addr().unwrap();
 
         drop(stream1);
         drop(stream2);
@@ -103,8 +115,8 @@ mod tests {
         // Retrieve streams for both URIs again; should reuse connections from the pool
         let (stream1b, stream2b) = tokio::join!(get_stream(uri1), get_stream(uri2));
 
-        let addr1b = stream1b.unwrap().stream.peer_addr().unwrap();
-        let addr2b = stream2b.unwrap().stream.peer_addr().unwrap();
+        let addr1b = stream1b.unwrap().stream_mut().peer_addr().unwrap();
+        let addr2b = stream2b.unwrap().stream_mut().peer_addr().unwrap();
 
         assert_eq!(
             addr1.as_pathname(),

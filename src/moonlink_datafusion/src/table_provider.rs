@@ -1,4 +1,4 @@
-use crate::connection_pool::{get_stream, return_stream, PooledStream};
+use crate::connection_pool::{get_stream, PooledStream};
 use crate::error::Result;
 use arrow::datatypes::SchemaRef;
 use arrow_ipc::reader::StreamReader;
@@ -40,8 +40,12 @@ pub struct MooncakeTableProvider {
 impl MooncakeTableProvider {
     pub async fn try_new(uri: &str, schema: String, table: String, lsn: u64) -> Result<Self> {
         let mut pooled_stream = get_stream(uri).await?;
-        let table_schema =
-            get_table_schema(&mut pooled_stream.stream, schema.clone(), table.clone()).await?;
+        let table_schema = get_table_schema(
+            &mut pooled_stream.stream_mut(),
+            schema.clone(),
+            table.clone(),
+        )
+        .await?;
         let table_schema = StreamReader::try_new(table_schema.as_slice(), None)?.schema();
         let scan = Arc::new(MooncakeTableScan::try_new(pooled_stream, schema, table, lsn).await?);
         Ok(Self {
@@ -218,7 +222,7 @@ impl MooncakeTableScan {
         lsn: u64,
     ) -> Result<Self> {
         let metadata = scan_table_begin(
-            &mut pooled_stream.stream,
+            &mut pooled_stream.stream_mut(),
             schema.clone(),
             table.clone(),
             lsn,
@@ -242,10 +246,9 @@ impl Drop for MooncakeTableScan {
         let table = std::mem::take(&mut self.table);
         tokio::spawn(async move {
             let mut pooled_stream = pooled_stream.expect("stream should be set by try_new");
-            if let Err(e) = scan_table_end(&mut pooled_stream.stream, schema, table).await {
+            if let Err(e) = scan_table_end(&mut pooled_stream.stream_mut(), schema, table).await {
                 eprintln!("scan_table_end error: {e}");
             }
-            return_stream(pooled_stream).await;
         });
     }
 }
