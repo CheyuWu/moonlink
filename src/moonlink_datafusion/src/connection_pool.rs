@@ -69,14 +69,24 @@ pub(crate) async fn get_stream(uri: &str) -> crate::Result<PooledStream> {
             // Remove expired streams
             vec.retain(|entry| entry.last_used.elapsed() <= idle_timeout());
 
-            if let Some(entry) = vec.pop() {
-                return Ok(PooledStream::new(uri.to_string(), entry.stream));
+            while let Some(entry) = vec.pop() {
+                if is_connection_alive(&entry.stream).await {
+                    return Ok(PooledStream::new(uri.to_string(), entry.stream));
+                }
             }
         }
     }
     // If there are no available streams, create a new one
     let stream = UnixStream::connect(uri).await?;
     Ok(PooledStream::new(uri.to_string(), stream))
+}
+
+async fn is_connection_alive(stream: &UnixStream) -> bool {
+    match stream.try_read(&mut []) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
 }
 
 pub async fn start_maintenance_task() {
